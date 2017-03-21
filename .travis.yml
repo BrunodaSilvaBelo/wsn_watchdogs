@@ -1,0 +1,24 @@
+language: generic
+
+sudo: false
+
+cache:
+  apt: true
+
+matrix:
+  include:
+    - env: CXX=g++-6 CC=gcc-6 COMPILER=g++-6
+      addons:
+        apt:
+          packages:
+            - g++-6
+          sources: &sources
+            - ubuntu-toolchain-r-test
+
+install:
+  - mkdir build && cd build
+  - cmake -DCMAKE_BUILD_TYPE=Release ../
+  - cmake --build .
+
+script:
+- ctest -V

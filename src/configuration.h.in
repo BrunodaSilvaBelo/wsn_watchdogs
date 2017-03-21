@@ -1,0 +1,2 @@
+#define PROGRAM_VERSION "@bench_VERSION@"
+#define PROGRAM_NAME "@MAIN_EXECUTABLE@"
