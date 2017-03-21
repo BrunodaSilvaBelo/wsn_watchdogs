@@ -228,7 +228,7 @@ void Node::run() {
     }
 
     for (auto& i : watching) {
-      if (diff_time(current_time,i.second) > 10)
+      if (diff_time(current_time,i.second) > 10){}
 
     }
 
