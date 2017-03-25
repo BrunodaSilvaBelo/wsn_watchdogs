@@ -25,13 +25,28 @@ int main(int argc, char** argv) {
   }
   std::vector<std::thread> threads(nodes_size);
 
-  for (std::size_t i = 0; i < nodes_size; ++i)
+  for (std::size_t i = 0; i < nodes_size; ++i) {
     Network::instance().nodes.emplace_back(i);
+  }
 
   for (std::size_t i = 0; i < nodes_size; ++i)
     threads[i]       = std::thread(
         [](std::size_t id) { Network::instance().nodes[id].run(); }, i);
+  auto current_time  = Clock::now();
+  auto start_time    = current_time;
+  auto previous_time = current_time;
+  for (;;) {
+    if (std::chrono::duration<double>(current_time - previous_time).count() >
+        ((50 * Network::instance().minutes_running) / 7)) {
+      Network::instance().chance_to_fail += 5;
+      previous_time = current_time;
+    }
 
+    if (std::chrono::duration<double>(current_time - start_time).count() >
+        60 * Network::instance().minutes_running)
+      break;
+    current_time = Clock::now();
+  }
   for (auto& i : threads)
     i.join();
 
@@ -56,7 +71,6 @@ int main(int argc, char** argv) {
   std::cout << "Rate between data package and non data package is ";
   std::cout << static_cast<float>(metric_data) /
                    static_cast<float>(metric_non_data)
-            << "\n";
-
+            << " " << metric_data << " " << metric_non_data << "\n";
   return 0;
 }

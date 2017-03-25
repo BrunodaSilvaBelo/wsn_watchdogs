@@ -10,6 +10,7 @@ namespace {
 std::mt19937 seed(1);
 
 enum class package_data { sender, destination, type, id };
+std::vector<std::mutex> mutexes;
 }
 
 static auto get_random_id() {
@@ -18,13 +19,13 @@ static auto get_random_id() {
 }
 
 static auto is_failed() {
-  static std::uniform_int_distribution<> gen(0, 100);
-  return static_cast<std::size_t>(gen(seed)) <
+  static std::uniform_int_distribution<> gen(1, 100);
+  return static_cast<std::size_t>(gen(seed)) >
          Network::instance().chance_to_fail;
 }
 
 template <typename T> static void log(T&& message) {
-  if (false) {
+  if (Network::instance().debug) {
     static std::mutex mu;
     std::lock_guard<std::mutex> locker(mu);
     std::cout << std::forward<T>(message) << "\n";
@@ -63,23 +64,52 @@ static void update_cache(Container const& container, std::size_t id) {
   std::copy_n(std::begin(container), idx, std::front_inserter(aux_route));
   Container route;
   for (std::size_t i = 1; i < aux_route.size(); ++i) {
-    if (!Network::instance().path[id][aux_route[i]].empty())
-      continue;
-
     std::copy_n(std::begin(aux_route), i + 1, std::back_inserter(route));
-    Network::instance().path[id][aux_route[i]] = route;
+    bool repeated = false;
+    for (auto& z : Network::instance().path[id][aux_route[i]])
+      if (z.first == route)
+        repeated = true;
+    if (repeated)
+      continue;
+    auto rater = 0.f;
+    for (auto& x : route)
+      rater += Network::instance().pathrater[id][x];
+    Network::instance().path[id][aux_route[i]].push_back(
+        std::make_pair(route, rater / route.size()));
     route.clear();
   }
 }
 
+template <typename T> static auto choose_best_route(T sender, T destination) {
+  auto& routes = Network::instance().path[sender][destination];
+  for (auto& x : routes) {
+    x.second = 0;
+    for (auto& i : x.first)
+      x.second += Network::instance().pathrater[sender][i];
+    x.second /= x.first.size();
+  }
+
+  auto result = std::max_element(std::begin(routes), std::end(routes),
+                                 [](auto& x, auto& y) {
+                                   if (x.second < y.second)
+                                     return true;
+                                   if (x.second == y.second)
+                                     return x.first.size() < y.first.size();
+
+                                   return false;
+                                 });
+
+  return (*result).first;
+}
 void Network_Impl::generate(std::size_t size) {
+  mutexes = std::vector<std::mutex>(size);
   std::vector<bool> graph_col(size, false);
   graph = std::vector<std::vector<bool>>(size, std::move(graph_col));
 
   std::uniform_int_distribution<> gen(0, 1);
   std::uniform_int_distribution<> gen2(0, size);
   for (std::size_t i = 0; i < size; ++i) {
-    auto con{static_cast<std::size_t>(gen2(seed))};
+    auto con{static_cast<std::size_t>(gen2(seed))/2};
     for (std::size_t j = 0, counter = 0; j < size; ++j) {
       if (con == counter)
         break;
@@ -92,16 +122,14 @@ void Network_Impl::generate(std::size_t size) {
       graph[i - 1][i] = true;
   }
 
-  std::vector<double> pathrater_col(size, 0.5);
-  pathrater = std::vector<std::vector<double>>(size, std::move(pathrater_col));
+  std::vector<float> pathrater_col(size, 0.5f);
+  pathrater = std::vector<std::vector<float>>(size, std::move(pathrater_col));
   for (std::size_t i = 0; i < size; ++i)
-    for (std::size_t j = i; j < size; ++j)
-      if (i == j)
-        graph[i][i] = 1.;
+    pathrater[i][i]  = 1.f;
 
-  std::vector<std::deque<std::size_t>> path_col(size);
-  path = std::vector<std::vector<std::deque<std::size_t>>>(size,
-                                                           std::move(path_col));
+  path.resize(size);
+  for (auto& i : path)
+    i.resize(size);
 
   std::map<message_type, std::size_t> metrics{{message_type::data, 0},
                                               {message_type::route_reply, 0},
@@ -128,7 +156,7 @@ void Node::send(std::size_t destination) {
     package.route.push_back(id);
     send(package, communication_type::broadcast);
   } else {
-    package.route = Network::instance().path[id][destination];
+    package.route = choose_best_route(id, package.destination);
     send(package);
   }
 }
@@ -146,7 +174,9 @@ void Node::send(Package package, communication_type comm) {
         receive(package);
         return;
       } else {
-        package.route = Network::instance().path[id][package.destination];
+        package.route = choose_best_route(id, package.destination);
+        if (Network::instance().watchdog)
+          watching.emplace_back(package, Clock::now());
       }
     }
     ++Network::instance().metric[id][package.type];
@@ -161,31 +191,34 @@ void Node::run() {
   };
   auto previous_time = Clock::now();
   auto start_time    = previous_time;
-  static std::uniform_int_distribution<> gen(0, Network::instance().size());
-  auto random_send = gen(seed);
+  auto update_time   = previous_time;
+  static std::uniform_int_distribution<> gen(0, Network::instance().size() - 1);
+  auto random_send        = gen(seed);
+  std::size_t last_number = 2;
   for (;;) {
     auto current_time = Clock::now();
 
     if (!package_buffer.empty()) {
+      mutexes[id].lock();
       auto package = package_buffer.front();
       package_buffer.pop_front();
-
+      mutexes[id].unlock();
       if (package.type == message_type::route_request) {
         auto repeated =
             std::find(std::begin(route_requests), std::end(route_requests),
                       std::make_pair(package.sender, package.id));
-        if (repeated == std::end(route_requests)) {
-          if (package.destination == id) {
-            package.route.push_back(id);
-            log("#### Route request from " + std::to_string(package.sender) +
-                " arrive to " + std::to_string(id));
-            update_cache(package.route, id);
-            Package pac(id, package.sender, message_type::route_reply);
-            auto route = package.route;
-            std::reverse(std::begin(route), std::end(route));
-            pac.route = route;
-            send(pac);
-          } else {
+        if (package.destination == id) {
+          package.route.push_back(id);
+          log("#### Route request from " + std::to_string(package.sender) +
+              " arrive to " + std::to_string(id));
+          update_cache(package.route, id);
+          Package pac(id, package.sender, message_type::route_reply);
+          auto route = package.route;
+          std::reverse(std::begin(route), std::end(route));
+          pac.route = route;
+          send(pac);
+        } else {
+          if (repeated == std::end(route_requests)) {
             package.route.push_back(id);
             send(package, communication_type::broadcast);
           }
@@ -207,29 +240,69 @@ void Node::run() {
               " arrives to " + std::to_string(id));
         } else {
           update_cache(package.route, id);
-	  if (id == package.sender)
-	    send(package);
-	  else {
-	    if (!is_failed()) {
-	      send(package);
-              auto watcher{next_route(package.route, id)};
-              if (watcher == package.route.size() - 1)
-                --watcher;
-              else
-                watcher -= 2;
-              Package pac(id, watcher, message_type::watchdog);
-              send(pac);
-            }
-	  }
+          if (id == package.sender)
+            send(package);
+          else {
+            if (s == status::normal) {
+              send(package);
+              if (Network::instance().watchdog) {
+                decltype(package.route) route;
+                std::reverse_copy(std::begin(package.route),
+                                  std::end(package.route),
+                                  std::back_inserter(route));
+                package.type  = message_type::watchdog;
+                package.route = route;
+                send(package);
+              }
+            } else {
+	      log("++++");
+	    }
+          }
         }
       } else if (package.type == message_type::watchdog) {
-
+        if (Network::instance().watchdog)
+          Network::instance().pathrater[id][package.sender] += 0.01;
       }
     }
 
-    for (auto& i : watching) {
-      if (diff_time(current_time,i.second) > 10){}
+    if (Network::instance().watchdog) {      {
+        std::lock_guard<std::mutex> locker(mutexes[id]);
+        for (std::size_t i = 0, end = package_buffer.size(); i < end; ++i) {
+          std::vector<std::size_t> erased;
+          for (std::size_t j = 0; j < watching.size(); ++j) {
+            if (diff_time(current_time, watching[j].second) >
+                Network::instance().timeout)
+              erased.push_back(j);
+            if (package_buffer[i].type == message_type::watchdog)
+              if (package_buffer[i].sender == watching[j].first.sender &&
+                  package_buffer[i].destination ==
+                      watching[j].first.destination &&
+                  package_buffer[i].id == watching[j].first.id)
+                erased.push_back(j);
+          }
 
+          for (auto& x : erased)
+            watching.erase(std::begin(watching) + x);
+          if (watching.empty())
+            break;
+        }
+      }
+
+      for (auto& i : watching)
+        if (diff_time(current_time, i.second) > Network::instance().timeout) {
+          Network::instance().pathrater[id][i.first.route[1]] = -100.f;
+          log("----");
+        }
+
+
+    }
+
+    if (diff_time(current_time, update_time) >
+        ((60 * Network::instance().minutes_running) / 7)) {
+      s = (is_failed()) ? status::misbehaved : status::normal;
+      if (Network::instance().watchdog)
+        watching.clear();
+      update_time = current_time;
     }
 
     if (diff_time(current_time, previous_time) > 5 + random_send) {
@@ -242,21 +315,20 @@ void Node::run() {
           ++des;
       }
       send(des);
-      watching.emplace_back(des, current_time);
       ++Network::instance().throughput[id].first;
       log("**** Node " + std::to_string(id) + " sending data to " +
           std::to_string(des));
       previous_time = current_time;
     }
 
-    if (diff_time(current_time, start_time) > 60 * 5)
+    if (diff_time(current_time, start_time) >
+        60 * Network::instance().minutes_running)
       break;
   }
 }
 
 void Node::receive(Package package) {
-  static std::mutex mu;
-  std::lock_guard<std::mutex> locker(mu);
+  std::lock_guard<std::mutex> locker(mutexes[id]);
   package_buffer.push_back(package);
 }
 

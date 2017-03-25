@@ -28,9 +28,15 @@ public:
   std::size_t size() const;
 
   std::size_t chance_to_fail = 0;
+  std::size_t const minutes_running = 5;
+  std::size_t const timeout = 10;
+  bool const watchdog = true;
+  bool const debug = true;
   std::vector<std::vector<bool>> graph;
-  std::vector<std::vector<std::deque<std::size_t>>> path;
-  std::vector<std::vector<double>> pathrater;
+  std::vector<
+      std::vector<std::vector<std::pair<std::deque<std::size_t>, float>>>>
+      path;
+  std::vector<std::vector<float>> pathrater;
   std::vector<std::map<message_type, std::size_t>> metric;
   std::vector<std::pair<std::size_t, std::size_t>> throughput;
   std::vector<Node> nodes;
@@ -38,7 +44,7 @@ public:
 
 class Node {
 public:
-  enum class status { paused, running };
+  enum class status { normal, misbehaved };
   Node(std::size_t id);
   void send(std::size_t destination);
   void send(Package package,
@@ -47,12 +53,13 @@ public:
   void run();
 
   std::size_t id;
-  status s;
+  status s = status::normal;
   std::deque<Package> package_buffer;
   std::vector<std::pair<std::size_t, std::size_t>> route_requests;
-  std::vector<std::pair<std::size_t,
-                        std::chrono::time_point<std::chrono::steady_clock>>>
+  std::vector<
+      std::pair<Package, std::chrono::time_point<std::chrono::steady_clock>>>
       watching;
+  std::deque<Package> watchdogs;
 };
 
 class Package {
@@ -65,6 +72,8 @@ public:
   message_type type;
   std::deque<std::size_t> route;
 };
+
+void network_run();
 
 using Network = Singleton<Network_Impl>;
 using Clock   = std::chrono::steady_clock;
